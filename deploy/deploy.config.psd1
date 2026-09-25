@@ -1,9 +1,9 @@
 @{
     # Azure subscription to deploy into.
-    subscriptionId            = '15ee9d5a-8493-49bb-9e40-eb32aa19ec94'
+    subscriptionId            = ''
 
     # Entra tenant ID. Leave blank to use the tenant of the current Az context (Connect-AzAccount).
-    tenantId                  = '2e811281-424e-4db0-bfd6-9e49ba4af4d9'
+    tenantId                  = ''
 
     # Resource group for the Automation Account. Created if it does not exist.
     resourceGroupName         = 'rg-MFARegisteredSync-automation'
