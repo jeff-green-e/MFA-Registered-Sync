@@ -7,10 +7,10 @@
     Runs as an Azure Automation PowerShell 7.2 runbook under a system-assigned managed
     identity. On each run it:
 
-      1. Enumerates users in scope (all users by default; guests and/or disabled accounts can
-         be excluded from scope via parameters).
-      2. Resolves which authentication method types "count" as MFA for this run - see
-         "Configuring qualifying methods" below.
+      1. Resolves its configuration - which target group, which users are in scope, and which
+         authentication method types "count" as MFA - see .NOTES below.
+      2. Enumerates users in scope (all users by default; guests and/or disabled accounts can
+         be excluded from scope).
       3. For each in-scope user, checks their registered authentication methods for at least
          one qualifying type.
       4. Computes the desired group membership: every in-scope user who has a qualifying
@@ -39,7 +39,9 @@
 .PARAMETER TargetGroupId
     Object ID of the dedicated, cloud-only security group that should contain every in-scope
     user with a qualifying MFA method. Membership of this group is fully reconciled by this
-    runbook on every run - do not add/remove members manually.
+    runbook on every run - do not add/remove members manually. Optional here only because it
+    can instead come from the 'TargetGroupId' Automation Variable (see .NOTES) - one of the
+    two is required, or the run stops before doing anything.
 
 .PARAMETER QualifyingMethodTypes
     Comma-separated list of authentication method keys that qualify as "MFA registered" for
@@ -49,11 +51,15 @@
     platformCredential, temporaryAccessPass, email, password.
 
 .PARAMETER ExcludeGuests
-    When $true (default), users with userType 'Guest' are excluded from scope - a B2B guest's
+    When $true, users with userType 'Guest' are excluded from scope - a B2B guest's
     authentication methods are registered and enforced in their home tenant, not this one.
+    Leave unset (the default, $null) to fall back to the 'ExcludeGuests' Automation Variable,
+    then to $true if that isn't set either.
 
 .PARAMETER ExcludeDisabledAccounts
-    When $true (default), users with accountEnabled = $false are excluded from scope.
+    When $true, users with accountEnabled = $false are excluded from scope. Leave unset (the
+    default, $null) to fall back to the 'ExcludeDisabledAccounts' Automation Variable, then to
+    $true if that isn't set either.
 
 .PARAMETER WhatIfMode
     When $true, computes and logs the add/remove plan but makes no changes to group
@@ -78,30 +84,36 @@
     isn't blocked by the ratio math.
 
 .NOTES
-    Configuring qualifying methods - checked in this order, first one found wins:
+    Configurable settings (TargetGroupId, ExcludeGuests, ExcludeDisabledAccounts,
+    QualifyingMethodTypes) each resolve in this order - first one found wins:
 
-      1. -QualifyingMethodTypes parameter (e.g. set on the schedule that triggers this
-         runbook). Works reliably in the Azure Automation cloud sandbox.
-      2. The $env:MFA_QUALIFYING_METHOD_TYPES environment variable. Azure Automation's cloud
-         sandbox does not currently support setting persistent custom environment variables
-         for a job, so this only takes effect when the runbook executes somewhere that
-         genuinely has that variable set in its process environment - a Hybrid Runbook
-         Worker (a host you control, where you can set a machine-level environment variable)
-         or a local test run. If you're running purely in the cloud sandbox, use the
-         -QualifyingMethodTypes parameter (via the schedule, see deploy.config.psd1's
-         mfaQualifyingMethodTypes) instead.
-      3. A built-in default (see $DefaultQualifyingMethodKeys below).
+      1. The matching explicit parameter, e.g. -QualifyingMethodTypes. Meant for one-off
+         manual/test runs (portal Test pane, Start-AzAutomationRunbook -Parameters) - the
+         scheduled run doesn't set these, so day-to-day config lives in step 2.
+      2. The like-named Automation Variable on this Automation Account (TargetGroupId,
+         ExcludeGuests, ExcludeDisabledAccounts, QualifyingMethodTypes), read via
+         Get-AutomationVariable. This is the supported way to change configuration without
+         redeploying or touching the schedule - the deploy script creates/updates these
+         variables from deploy.config.psd1, but they can also be edited directly in the
+         portal (Automation Account > Variables) and take effect on the very next run.
+      3. QualifyingMethodTypes only: the $env:MFA_QUALIFYING_METHOD_TYPES environment
+         variable. Azure Automation's cloud sandbox does not support setting a persistent
+         custom environment variable for a job, so this only takes effect somewhere that
+         genuinely has it set in its process environment - a Hybrid Runbook Worker (a host
+         you control) or a local test run.
+      4. A built-in default: $true for the two Exclude* settings, $DefaultQualifyingMethodKeys
+         for QualifyingMethodTypes, and (TargetGroupId only) a thrown error - there's no
+         sensible default target group.
 #>
 
 param(
-    [Parameter(Mandatory = $true)]
     [string]$TargetGroupId,
 
     [string]$QualifyingMethodTypes,
 
-    [bool]$ExcludeGuests = $true,
+    [Nullable[bool]]$ExcludeGuests,
 
-    [bool]$ExcludeDisabledAccounts = $true,
+    [Nullable[bool]]$ExcludeDisabledAccounts,
 
     [bool]$WhatIfMode = $false,
 
@@ -184,6 +196,77 @@ function Connect-Automation {
     }
 }
 
+function Get-AutomationVariableSafe {
+    <#
+        Get-AutomationVariable is only meaningful inside an actual Azure Automation job - it
+        doesn't exist (or has nothing to read) when this script runs locally or the variable
+        was never created. Treat "not available" and "not found" identically: both just mean
+        this source has nothing to contribute, not an error - the caller falls through to its
+        next configuration source.
+    #>
+    param([string]$Name)
+    if (-not (Get-Command Get-AutomationVariable -ErrorAction SilentlyContinue)) { return $null }
+    try {
+        return Get-AutomationVariable -Name $Name -ErrorAction Stop
+    }
+    catch {
+        return $null
+    }
+}
+
+function Resolve-StringSetting {
+    <#
+        Resolves a setting in the precedence order documented in .NOTES: explicit parameter,
+        then the like-named Automation Variable, then -Default. Throws if still unresolved
+        and -Required is set - used for TargetGroupId, which has no sensible default.
+    #>
+    param([string]$ParamValue, [string]$VariableName, [string]$Default, [switch]$Required)
+
+    if ($ParamValue) {
+        Write-RunbookLog "$VariableName = '$ParamValue' (from -$VariableName parameter)"
+        return $ParamValue
+    }
+
+    $varValue = Get-AutomationVariableSafe -Name $VariableName
+    if ($varValue) {
+        Write-RunbookLog "$VariableName = '$varValue' (from Automation Variable '$VariableName')"
+        return $varValue
+    }
+
+    if ($Default) {
+        Write-RunbookLog "$VariableName = '$Default' (built-in default - no parameter or Automation Variable set)"
+        return $Default
+    }
+
+    if ($Required) {
+        throw "STOP AND INVESTIGATE: no value configured for '$VariableName' - set the '$VariableName' Automation Variable on this Automation Account, or pass -$VariableName. No changes were made."
+    }
+
+    return $null
+}
+
+function Resolve-BoolSetting {
+    <#
+        Same precedence as Resolve-StringSetting, but for a bool with an always-present
+        default (so no -Required case exists here).
+    #>
+    param([Nullable[bool]]$ParamValue, [string]$VariableName, [bool]$Default)
+
+    if ($null -ne $ParamValue) {
+        Write-RunbookLog "$VariableName = $ParamValue (from -$VariableName parameter)"
+        return $ParamValue
+    }
+
+    $varValue = Get-AutomationVariableSafe -Name $VariableName
+    if ($null -ne $varValue) {
+        Write-RunbookLog "$VariableName = $varValue (from Automation Variable '$VariableName')"
+        return [bool]$varValue
+    }
+
+    Write-RunbookLog "$VariableName = $Default (built-in default - no parameter or Automation Variable set)"
+    return $Default
+}
+
 function Resolve-QualifyingMethodTypes {
     <#
         Returns a PSCustomObject { OdataTypes (HashSet[string]); Keys (string[]); Source
@@ -192,6 +275,7 @@ function Resolve-QualifyingMethodTypes {
     #>
     param([string]$ParamValue)
 
+    $varValue = Get-AutomationVariableSafe -Name 'QualifyingMethodTypes'
     $envValue = [System.Environment]::GetEnvironmentVariable($QualifyingMethodEnvVarName)
 
     $raw = $null
@@ -200,13 +284,17 @@ function Resolve-QualifyingMethodTypes {
         $raw = $ParamValue
         $source = '-QualifyingMethodTypes parameter'
     }
+    elseif ($varValue) {
+        $raw = $varValue
+        $source = "Automation Variable 'QualifyingMethodTypes'"
+    }
     elseif ($envValue) {
         $raw = $envValue
         $source = "environment variable `$env:$QualifyingMethodEnvVarName"
     }
     else {
         $raw = ($DefaultQualifyingMethodKeys -join ',')
-        $source = 'built-in default (no parameter or environment variable set)'
+        $source = 'built-in default (no parameter, Automation Variable, or environment variable set)'
     }
 
     $tokens = @($raw -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
@@ -317,12 +405,23 @@ function Test-HasQualifyingMfaMethod {
 
 # --- Main -------------------------------------------------------------
 
-Write-RunbookLog "=== Starting MFA-registered group sync (TargetGroupId=$TargetGroupId, ExcludeGuests=$ExcludeGuests, ExcludeDisabledAccounts=$ExcludeDisabledAccounts, WhatIfMode=$WhatIfMode) ==="
+Write-RunbookLog "=== Starting MFA-registered group sync (WhatIfMode=$WhatIfMode) ==="
+Write-RunbookLog "Resolving configuration (parameter > Automation Variable > default)..."
+
+$TargetGroupId = Resolve-StringSetting -ParamValue $TargetGroupId -VariableName 'TargetGroupId' -Required
+$ExcludeGuests = Resolve-BoolSetting -ParamValue $ExcludeGuests -VariableName 'ExcludeGuests' -Default $true
+$ExcludeDisabledAccounts = Resolve-BoolSetting -ParamValue $ExcludeDisabledAccounts -VariableName 'ExcludeDisabledAccounts' -Default $true
 
 Connect-Automation
 
 $qualifying = Resolve-QualifyingMethodTypes -ParamValue $QualifyingMethodTypes
 Write-RunbookLog "Qualifying MFA method types ($($qualifying.Source)): $($qualifying.Keys -join ', ')"
+
+# Flush before every long-running step below. Buffered messages are invisible until something
+# emits them, and the enumeration/per-user phases that follow can each run for many minutes on
+# a large tenant - without these flushes the job shows no output at all until it's essentially
+# finished, which is indistinguishable from a hang.
+Show-RunbookLog
 
 $upnLookup = Get-InScopeUsers -ExcludeGuests $ExcludeGuests -ExcludeDisabledAccounts $ExcludeDisabledAccounts
 
@@ -338,13 +437,18 @@ foreach ($m in $currentMembers) { [void]$currentMemberIds.Add($m.Id) }
 Write-RunbookLog "Target group currently has $($currentMemberIds.Count) member(s)."
 
 Write-RunbookLog "Checking MFA registration status for $($upnLookup.Count) in-scope user(s)..."
+Write-RunbookLog "  (one Graph call per user - expect roughly a second each; progress follows below)"
+Show-RunbookLog
 $desiredMemberSet = [System.Collections.Generic.HashSet[string]]::new()
 $qualifiedCount = 0
 $unknownCount = 0
 $userAuthDetail = @{}
 $checkedCount = 0
 $totalToCheck = $upnLookup.Count
-$progressInterval = [Math]::Max(1, [Math]::Ceiling($totalToCheck / 10))
+# Every 10% is far too coarse when this phase runs for an hour or more - cap the interval so
+# progress lands at least every 250 users no matter how big the tenant is.
+$progressInterval = [Math]::Min(250, [Math]::Max(1, [Math]::Ceiling($totalToCheck / 10)))
+$checkStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
 foreach ($userId in $upnLookup.Keys) {
     $authResult = Test-HasQualifyingMfaMethod -UserId $userId -QualifyingOdataTypes $qualifying.OdataTypes
@@ -366,7 +470,13 @@ foreach ($userId in $upnLookup.Keys) {
 
     $checkedCount++
     if ($checkedCount % $progressInterval -eq 0 -or $checkedCount -eq $totalToCheck) {
-        Write-RunbookLog "  ...checked $checkedCount of $totalToCheck user(s)."
+        $elapsed = $checkStopwatch.Elapsed
+        $projected = [TimeSpan]::FromTicks([long]($elapsed.Ticks / $checkedCount * $totalToCheck))
+        Write-RunbookLog ("  ...checked {0} of {1} user(s) - {2:hh\:mm\:ss} elapsed, ~{3:hh\:mm\:ss} projected total." -f `
+            $checkedCount, $totalToCheck, $elapsed, $projected)
+        # Safe here specifically because this loop is top-level Main code, not inside a
+        # function whose return value could be corrupted by pipeline output.
+        Show-RunbookLog
     }
 }
 

@@ -13,12 +13,21 @@
       3. Import and publish runbooks/Sync-MfaRegisteredGroup.ps1 as a PowerShell 7.2 runbook.
       4. Create the target security group (unless -TargetGroupId is supplied for an existing
          group).
-      5. Grant the managed identity's service principal the minimum Microsoft Graph
+      5. Create or update the Automation Variables the runbook reads its configuration from
+         at runtime - TargetGroupId, ExcludeGuests, ExcludeDisabledAccounts, and (if
+         -MfaQualifyingMethodTypes/config is set) QualifyingMethodTypes. These - not schedule
+         parameters - are the supported way to change this configuration later: editing a
+         variable's value in Automation Account > Variables takes effect on the runbook's next
+         run, with no redeploy and no touching the schedule.
+      6. Grant the managed identity's service principal the minimum Microsoft Graph
          application permissions the runbook needs:
            - User.Read.All                     (enumerate/resolve in-scope users)
            - UserAuthenticationMethod.Read.All (read registered authentication methods)
            - GroupMember.ReadWrite.All         (reconcile target group membership)
-      6. Create a recurring schedule and link it to the runbook with its parameters.
+      7. Create a recurring schedule (if missing) and link it to the runbook. The link only
+         ever carries WhatIfMode=$false - it never needs updating once created, since every
+         setting that can legitimately change lives in the Automation Variables from step 5
+         instead.
 
     Run this in a session already authenticated to Azure (Connect-AzAccount) with rights to
     create resources and assign roles, and be prepared to interactively consent to the Graph
@@ -63,18 +72,21 @@
     targetGroupDisplayName.
 
 .PARAMETER ExcludeGuests
-    Passed through to the runbook's -ExcludeGuests parameter on the schedule. Overrides the
-    config file's excludeGuests.
+    Written to the runbook's 'ExcludeGuests' Automation Variable. Overrides the config file's
+    excludeGuests. Can be changed later by editing that variable directly - see
+    runbooks/README.md.
 
 .PARAMETER ExcludeDisabledAccounts
-    Passed through to the runbook's -ExcludeDisabledAccounts parameter on the schedule.
-    Overrides the config file's excludeDisabledAccounts.
+    Written to the runbook's 'ExcludeDisabledAccounts' Automation Variable. Overrides the
+    config file's excludeDisabledAccounts. Can be changed later by editing that variable
+    directly - see runbooks/README.md.
 
 .PARAMETER MfaQualifyingMethodTypes
-    Passed through to the runbook's -QualifyingMethodTypes parameter on the schedule.
-    Overrides the config file's mfaQualifyingMethodTypes. Leave blank/unset to let the
-    runbook fall back to its environment variable / built-in default - see
-    runbooks/README.md.
+    Written to the runbook's 'QualifyingMethodTypes' Automation Variable. Overrides the config
+    file's mfaQualifyingMethodTypes. Leave blank/unset to leave that Automation Variable
+    unmanaged by this script (create/edit it directly, or set this and redeploy) - the
+    runbook falls back to its environment variable / built-in default when it isn't set. Can
+    be changed later by editing that variable directly - see runbooks/README.md.
 
 .PARAMETER ScheduleStartTime
     First run time for the schedule. Defaults to the next top of hour, at least 10 minutes
@@ -198,6 +210,67 @@ Write-Host "  MfaQualifyingMethodTypes  : $(if ($MfaQualifyingMethodTypes) { $Mf
 Write-Host "  ScheduleName              : $ScheduleName"
 Write-Host "  RequiredGraphModules      : $($RequiredGraphModules -join ', ')"
 Write-Host '=============================='
+
+function Assert-AzAutomationCapability {
+    <#
+        Az.Automation only grew the PowerShell 7.1/7.2 Runtime Environment surface this script
+        depends on in later releases. Az 10.0.0 (May 2023) ships Az.Automation 1.9.1, where
+        -RuntimeVersion doesn't exist on any of the module cmdlets and
+        Import-AzAutomationRunbook -Type doesn't accept PowerShell72 at all. Deploying from that
+        version fails with "A parameter cannot be found that matches parameter name
+        'RuntimeVersion'" - but only after the resource group and Automation Account have
+        already been created, leaving a half-built deployment behind.
+
+        Detect the capabilities instead of comparing version numbers: that keeps this correct
+        without pinning a minimum version, and it also catches the case where a current
+        Az.Automation is installed on disk but an older copy is already loaded in this session.
+        PowerShell will not swap an imported module, so updating in place and re-running in the
+        same window changes nothing - the fix there is a new terminal, not another install.
+    #>
+
+    $getCmd = Get-Command Get-AzAutomationModule -ErrorAction SilentlyContinue
+    if (-not $getCmd) {
+        throw "The Az.Automation module isn't available in this session. Install it with:`n    Install-Module Az.Automation -Scope CurrentUser -Force"
+    }
+
+    $loadedVersion = $getCmd.Module.Version
+    $missing = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($cmdletName in 'Get-AzAutomationModule', 'New-AzAutomationModule') {
+        if (-not (Get-Command $cmdletName).Parameters.ContainsKey('RuntimeVersion')) {
+            $missing.Add("$cmdletName has no -RuntimeVersion parameter")
+        }
+    }
+
+    $typeParam = (Get-Command Import-AzAutomationRunbook).Parameters['Type']
+    $validTypes = @(($typeParam.Attributes | Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] }).ValidValues)
+    if ($validTypes -notcontains 'PowerShell72') {
+        $missing.Add("Import-AzAutomationRunbook -Type doesn't accept PowerShell72 (accepts: $($validTypes -join ', '))")
+    }
+
+    if ($missing.Count -gt 0) {
+        $newestInstalled = Get-Module -ListAvailable -Name Az.Automation | Sort-Object Version -Descending | Select-Object -First 1
+        $fix = if ($newestInstalled -and $newestInstalled.Version -gt $loadedVersion) {
+            "Az.Automation $($newestInstalled.Version) IS already installed on disk - this session just has the older $loadedVersion loaded, and PowerShell can't swap an imported module at runtime. No reinstall needed: close this terminal, open a new one, Connect-AzAccount, and re-run."
+        }
+        else {
+            "Update it, then re-run from a NEW terminal (PowerShell won't reload a module already imported in this one):`n    Install-Module Az.Automation -Scope CurrentUser -Force`n    # then close this window, open a new one, Connect-AzAccount, and re-run"
+        }
+
+        throw "STOP: the Az.Automation loaded here ($loadedVersion) predates PowerShell 7.1/7.2 Runtime Environment support, which this deployment requires:`n  - $($missing -join "`n  - ")`n`n$fix`n`nNothing has been created - this check runs before any resources are touched."
+    }
+
+    Write-Host "Az.Automation $loadedVersion supports the PowerShell 7.2 Runtime Environment cmdlets."
+
+    # Not fatal, but worth flagging: the Az.Accounts that shipped alongside those old
+    # Az.Automation builds (2.12.3 in Az 10.0.0, May 2023) fails token acquisition against
+    # current Entra with "A task was canceled." on every tenant, which surfaces here as
+    # Set-AzContext reporting "Please provide a valid tenant or a valid subscription."
+    $accountsVersion = (Get-Module Az.Accounts | Sort-Object Version -Descending | Select-Object -First 1).Version
+    if ($accountsVersion -and $accountsVersion -lt [version]'3.0.0') {
+        Write-Warning "Az.Accounts $accountsVersion is old enough that token acquisition often fails with 'A task was canceled.' If Connect-AzAccount or Set-AzContext fails below, update the whole Az module (Install-Module Az -Scope CurrentUser -Force) and re-run from a new terminal."
+    }
+}
 
 function Get-AutomationModuleRecord {
     <#
@@ -329,6 +402,10 @@ function Import-PinnedGraphModules {
     Write-Host "Pinned local Microsoft.Graph modules to version $pinnedVersion : $($ModuleNames -join ', ')"
 }
 
+# --- Preflight ----------------------------------------------------------
+
+Assert-AzAutomationCapability
+
 # --- Azure context -----------------------------------------------------
 
 Write-Host "Setting Azure context to subscription $SubscriptionId..."
@@ -411,6 +488,48 @@ else {
 }
 Write-Host "Target group ID: $TargetGroupId"
 
+# --- Automation Variables (persistent, portal-editable configuration) ---
+
+<#
+    TargetGroupId, ExcludeGuests, ExcludeDisabledAccounts, and QualifyingMethodTypes live as
+    Automation Variables rather than schedule parameters, specifically so they can be changed
+    later without redeploying or touching the schedule at all - a scheduled runbook's linked
+    parameters can't be edited in the portal (or updated by Register-AzAutomationScheduledRunbook,
+    which has no "update" mode), but an Automation Variable's value can be edited directly in
+    Automation Account > Variables, and the runbook picks up the new value on its very next
+    run. The runbook still accepts the matching parameter as a one-off override for manual/
+    test runs - see runbooks/README.md.
+#>
+function Set-AutomationVariableValue {
+    param([string]$Name, [object]$Value, [string]$Description)
+
+    $existing = Get-AzAutomationVariable -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Name $Name -ErrorAction SilentlyContinue
+    if ($existing) {
+        Set-AzAutomationVariable -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName `
+            -Name $Name -Value $Value -Encrypted $false | Out-Null
+        Write-Host "Updated Automation Variable '$Name' = $Value"
+    }
+    else {
+        New-AzAutomationVariable -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName `
+            -Name $Name -Value $Value -Encrypted $false -Description $Description | Out-Null
+        Write-Host "Created Automation Variable '$Name' = $Value"
+    }
+}
+
+Set-AutomationVariableValue -Name 'TargetGroupId' -Value $TargetGroupId `
+    -Description 'Object ID of the security group Sync-MfaRegisteredGroup reconciles. Managed by deploy.config.psd1 (targetGroupId/targetGroupDisplayName) - edits here are overwritten on the next deploy.'
+Set-AutomationVariableValue -Name 'ExcludeGuests' -Value $ExcludeGuests `
+    -Description 'Sync-MfaRegisteredGroup: exclude guest accounts from scope. Editable here directly - takes effect on the next run, no redeploy needed.'
+Set-AutomationVariableValue -Name 'ExcludeDisabledAccounts' -Value $ExcludeDisabledAccounts `
+    -Description 'Sync-MfaRegisteredGroup: exclude disabled accounts from scope. Editable here directly - takes effect on the next run, no redeploy needed.'
+if ($MfaQualifyingMethodTypes) {
+    Set-AutomationVariableValue -Name 'QualifyingMethodTypes' -Value $MfaQualifyingMethodTypes `
+        -Description 'Sync-MfaRegisteredGroup: comma-separated authentication method keys that qualify as MFA registered. Editable here directly - takes effect on the next run, no redeploy needed.'
+}
+else {
+    Write-Host "mfaQualifyingMethodTypes not set in config - leaving the 'QualifyingMethodTypes' Automation Variable untouched (create/edit it directly in the portal, or set mfaQualifyingMethodTypes and redeploy, to override the runbook's built-in default)."
+}
+
 # --- Grant Graph application permissions to the managed identity --------
 
 $miServicePrincipal = Get-MgServicePrincipal -ServicePrincipalId $miPrincipalId
@@ -449,18 +568,17 @@ else {
 $linked = Get-AzAutomationScheduledRunbook -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -RunbookName $RunbookName -ErrorAction SilentlyContinue |
     Where-Object { $_.ScheduleName -eq $ScheduleName }
 if (-not $linked) {
+    <#
+        WhatIfMode is the only parameter still passed at link time - it's deliberately never
+        $true here (that's for a manual one-off dry run, not the recurring schedule) so there's
+        nothing about this link that config changes would ever need to update. Everything that
+        can legitimately change over time (TargetGroupId, ExcludeGuests,
+        ExcludeDisabledAccounts, QualifyingMethodTypes) lives in Automation Variables instead
+        (see above) precisely so it stays editable without ever touching this link again.
+    #>
     Write-Host "Linking schedule $ScheduleName to runbook $RunbookName..."
-    $scheduleParameters = @{
-        TargetGroupId           = $TargetGroupId
-        ExcludeGuests           = $ExcludeGuests
-        ExcludeDisabledAccounts = $ExcludeDisabledAccounts
-        WhatIfMode              = $false
-    }
-    if ($MfaQualifyingMethodTypes) {
-        $scheduleParameters['QualifyingMethodTypes'] = $MfaQualifyingMethodTypes
-    }
     Register-AzAutomationScheduledRunbook -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName `
-        -RunbookName $RunbookName -ScheduleName $ScheduleName -Parameters $scheduleParameters | Out-Null
+        -RunbookName $RunbookName -ScheduleName $ScheduleName -Parameters @{ WhatIfMode = $false } | Out-Null
 }
 else {
     Write-Host "Schedule $ScheduleName is already linked to runbook $RunbookName."

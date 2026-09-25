@@ -1,6 +1,6 @@
 # MFA Registered Sync
 
-Keeps a security group reconciled against the current set of Entra ID users who have at least one qualifying MFA authentication method registered. Which methods qualify is configurable — see [Configuring qualifying methods](runbooks/README.md#configuring-qualifying-methods). Users who register a qualifying method are added to the group; users who no longer have one are removed.
+Keeps a security group reconciled against the current set of Entra ID users who have at least one qualifying MFA authentication method registered. Which methods qualify — and which users are in scope — is configurable via Automation Variables, editable in the portal with no redeploy needed; see [Configuring settings](runbooks/README.md#configuring-settings). Users who register a qualifying method are added to the group; users who no longer have one are removed.
 
 ## Repository structure
 
@@ -45,12 +45,16 @@ PowerShell 7+ recommended (Windows PowerShell 5.1 also works, the Az/Graph modul
 
 | Module | Minimum version | Why |
 |---|---|---|
-| `Az.Accounts` | any recent | `Connect-AzAccount`, `Set-AzContext` |
+| `Az.Accounts` | **3.0.0+** | `Connect-AzAccount`, `Set-AzContext`. Older builds (2.12.x, shipped in Az 10.0.0) fail token acquisition against current Entra with `Unable to acquire token for tenant ... with error 'A task was canceled.'` on every tenant, surfacing as `Set-AzContext: Please provide a valid tenant or a valid subscription` — even though `Get-AzContext` right afterwards shows a perfectly valid-looking context, because that only reads cached context metadata and doesn't prove a usable token exists. |
 | `Az.Resources` | any recent | resource group creation |
 | `Az.Automation` | **1.10.0+** | module import (`New-`/`Get-AzAutomationModule -RuntimeVersion '7.2'`), runbook import/publish (`-Type PowerShell72`), schedule create + link. `-RuntimeVersion` matters: PowerShell 7.1/7.2 runbooks execute against a distinct "Runtime Environment" resource, not the classic account-wide module store - the two don't sync. A module imported without `-RuntimeVersion` can show `provisioningState: Succeeded` yet be invisible to the runbook and to the Runtime Environment's package list in the portal. |
 | `Microsoft.Graph.Authentication` | same version as the two rows below | `Connect-MgGraph` |
 | `Microsoft.Graph.Groups` | same version as the other two | `New-MgGroup`, group membership |
 | `Microsoft.Graph.Applications` | same version as the other two | `Get-MgServicePrincipal`, `New-MgServicePrincipalAppRoleAssignment` |
+
+**Installing the `Az` bundle instead of individual modules? The bundle version decides both rows above.** `Az.Automation 1.10.0` first shipped in **Az 11.2.0** (Jan 2024), and `Az.Accounts 3.0.0` in **Az 12.0.0** (May 2024) — so **Az 12.0.0 or newer satisfies both**. Anything older fails: Az 10.0.0 (May 2023) ships `Az.Automation 1.9.1` *and* `Az.Accounts 2.12.3`, which is both failure modes at once. Check with `Get-InstalledModule Az` and note that `Update-PSResource Az` only looks at `CurrentUser` scope — if the bundle was installed for `AllUsers` (under `C:\Program Files`), it reports "No installed packages were found with name 'Az'" and updates nothing.
+
+**Updating a module does not update a PowerShell session that already loaded it.** PowerShell can't swap an imported module at runtime, and `Remove-Module` only drops the wrapper, not the underlying .NET assembly. After any `Install-Module`/`Update-Module` here, **close the terminal, open a new one, and `Connect-AzAccount` again** before re-running — otherwise the old version is still in play and nothing appears to change. The deploy script preflights for this and tells you which case you're in before it touches any resource.
 
 These `Microsoft.Graph.*` modules are for the deploy script's own **local** calls (creating the target group, granting the managed identity its permissions) — they are separate from the Graph modules the *runbook* uses at runtime, which the deploy script imports into the Automation Account's PowerShell 7.2 Runtime Environment via `Az.Automation` cmdlets and don't need to be installed locally at all. See [deploy/README.md](deploy/README.md#two-separate-needs-graph-surfaces--dont-conflate-them) for the full split.
 
@@ -78,7 +82,7 @@ Before filling in [deploy/deploy.config.psd1](deploy/deploy.config.psd1), decide
 | `cadenceDays` | Days between scheduled runbook runs (`1` = daily). |
 | `excludeGuests` | Whether guest accounts are excluded from scope (default `$true`). |
 | `excludeDisabledAccounts` | Whether disabled accounts are excluded from scope (default `$true`). |
-| `mfaQualifyingMethodTypes` | Comma-separated list of authentication method keys that count as "MFA registered". Leave blank for the runbook's default. See [runbooks/README.md](runbooks/README.md#configuring-qualifying-methods). |
+| `mfaQualifyingMethodTypes` | Comma-separated list of authentication method keys that count as "MFA registered". Leave blank for the runbook's default. Written to the `QualifyingMethodTypes` Automation Variable — also editable directly in the portal afterward. See [runbooks/README.md](runbooks/README.md#configuring-settings). |
 
 **Target group**, specifically:
 - Let the deploy script create a new, dedicated security group (default, via `targetGroupDisplayName`), or

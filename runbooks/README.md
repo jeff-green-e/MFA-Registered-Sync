@@ -6,19 +6,22 @@ Runs under the Automation Account's **system-assigned managed identity** — see
 
 ## What it does, each run
 
-1. **Enumerate in-scope users.** Pulls users via `Get-MgUser -All`. `-ExcludeGuests` (default `$true`) drops `userType eq 'Guest'` accounts — a B2B guest's authentication methods live and are enforced in their home tenant, not this one. `-ExcludeDisabledAccounts` (default `$true`) drops `accountEnabled eq $false` accounts.
-2. **Resolve qualifying method types.** See [Configuring qualifying methods](#configuring-qualifying-methods) below.
+1. **Resolve configuration.** `TargetGroupId`, `ExcludeGuests`, `ExcludeDisabledAccounts` — and, later, `QualifyingMethodTypes` — each resolve from an explicit parameter, then a like-named Automation Variable, then a built-in default. See [Configuring settings](#configuring-settings) below.
+2. **Enumerate in-scope users.** Pulls users via `Get-MgUser -All`. `ExcludeGuests` (default `$true`) drops `userType eq 'Guest'` accounts — a B2B guest's authentication methods live and are enforced in their home tenant, not this one. `ExcludeDisabledAccounts` (default `$true`) drops `accountEnabled eq $false` accounts.
 3. **Check MFA registration status.** For each in-scope user, checks their registered authentication methods for at least one qualifying type.
 4. **Compute the desired membership.** Every in-scope user with a qualifying method belongs in the group. A user whose method lookup fails is left exactly as they are — not added, not removed (see [Fail-safe direction](#fail-safe-direction-leave-unchanged) below).
-5. **Reconcile the group.** Adds/removes members of `-TargetGroupId` so its membership exactly matches the desired set. **The group must be dedicated solely to this automation** — anything added to it manually will be removed on the next run.
+5. **Reconcile the group.** Adds/removes members of `TargetGroupId` so its membership exactly matches the desired set. **The group must be dedicated solely to this automation** — anything added to it manually will be removed on the next run.
 
-## Configuring qualifying methods
+## Configuring settings
 
-Which authentication method types count as "MFA registered" is configurable, checked in this order — first one found wins:
+`TargetGroupId`, `ExcludeGuests`, `ExcludeDisabledAccounts`, and `QualifyingMethodTypes` each resolve in this order — first one found wins:
 
-1. **`-QualifyingMethodTypes` parameter** — a comma-separated list of keys, e.g. `fido2,windowsHelloForBusiness,microsoftAuthenticator`. Set this via the schedule (see `mfaQualifyingMethodTypes` in [deploy.config.psd1](../deploy/deploy.config.psd1)) — this works reliably in the Azure Automation cloud sandbox.
-2. **`$env:MFA_QUALIFYING_METHOD_TYPES` environment variable.** Azure Automation's cloud sandbox does not currently support setting a persistent custom environment variable for a job, so this only takes effect where the runbook's process actually has that variable set — a Hybrid Runbook Worker (a host you control) or a local test run. If you're running purely in the cloud sandbox, use the parameter above instead.
-3. **Built-in default:** `fido2, windowsHelloForBusiness, microsoftAuthenticator, softwareOath, hardwareOath, phone, x509Certificate, platformCredential`.
+1. **The matching explicit parameter** (`-TargetGroupId`, `-ExcludeGuests`, `-ExcludeDisabledAccounts`, `-QualifyingMethodTypes`). Meant for a one-off manual/test run (portal Test pane, `Start-AzAutomationRunbook -Parameters`) — the recurring schedule doesn't set these.
+2. **The like-named Automation Variable** on this Automation Account (`TargetGroupId`, `ExcludeGuests`, `ExcludeDisabledAccounts`, `QualifyingMethodTypes`), read via `Get-AutomationVariable`. **This is the supported way to change day-to-day configuration** — the deploy script creates/updates these from [deploy.config.psd1](../deploy/deploy.config.psd1), but they can also be edited directly in the portal (**Automation Account → Variables**) and take effect on the very next run, with no redeploy and no touching the schedule.
+3. **`QualifyingMethodTypes` only:** the `$env:MFA_QUALIFYING_METHOD_TYPES` environment variable. Azure Automation's cloud sandbox does not support setting a persistent custom environment variable for a job, so this only takes effect where the runbook's process genuinely has it set — a Hybrid Runbook Worker (a host you control) or a local test run.
+4. **A built-in default:** `$true` for `ExcludeGuests`/`ExcludeDisabledAccounts`; `fido2, windowsHelloForBusiness, microsoftAuthenticator, softwareOath, hardwareOath, phone, x509Certificate, platformCredential` for `QualifyingMethodTypes`; and, for `TargetGroupId` only, a thrown error — there's no sensible default target group.
+
+Each resolved value is logged at the start of the run, along with which source it came from.
 
 Valid keys and the Graph authentication method type each maps to:
 
@@ -74,11 +77,11 @@ The isolated per-user fail-safe (one user's lookup fails → membership left unc
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `TargetGroupId` | *(required)* | Object ID of the dedicated target group. |
-| `QualifyingMethodTypes` | *(none — falls through to env var / built-in default)* | Comma-separated qualifying method keys. See [Configuring qualifying methods](#configuring-qualifying-methods). |
-| `ExcludeGuests` | `$true` | Drop guest accounts from scope. |
-| `ExcludeDisabledAccounts` | `$true` | Drop disabled accounts from scope. |
-| `WhatIfMode` | `$false` | Compute and log the plan, but apply no changes. Use for a manual dry-run job. |
+| `TargetGroupId` | *(none — falls through to Automation Variable, then errors)* | Object ID of the dedicated target group. See [Configuring settings](#configuring-settings). |
+| `QualifyingMethodTypes` | *(none — falls through to Automation Variable / env var / built-in default)* | Comma-separated qualifying method keys. See [Configuring settings](#configuring-settings). |
+| `ExcludeGuests` | *(unset — falls through to Automation Variable, then `$true`)* | Drop guest accounts from scope. |
+| `ExcludeDisabledAccounts` | *(unset — falls through to Automation Variable, then `$true`)* | Drop disabled accounts from scope. |
+| `WhatIfMode` | `$false` | Compute and log the plan, but apply no changes. Use for a manual dry-run job. Always a parameter, never an Automation Variable - it's meant for a one-off run, not a persistent setting. |
 | `MaxAuthLookupFailureRate` | `0.2` | See circuit breakers above. |
 | `MaxMembershipChangeRatio` | `0.3` | See circuit breakers above. |
 | `MinMembershipChangeFloor` | `5` | See circuit breakers above. |
