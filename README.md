@@ -67,6 +67,24 @@ Get-Module -ListAvailable Az.Accounts, Az.Resources, Az.Automation, Microsoft.Gr
 Install-Module Az.Accounts, Az.Resources, Az.Automation, Microsoft.Graph.Authentication, Microsoft.Graph.Groups, Microsoft.Graph.Applications -Scope CurrentUser -Force
 ```
 
+**Upgrade `Az` and `Microsoft.Graph` together, never one alone.** The deploy script authenticates to Azure first and then imports the Graph modules into the same PowerShell process, and both families bundle their own private copies of `Microsoft.Identity.Client` (MSAL), `Azure.Core` and `Azure.Identity`. Az's copies are already loaded by the time Graph imports, and the CLR will not hold two versions of the same assembly — so a mismatched pair fails at `Import-Module` with `Assembly with same name is already loaded`. A fresh terminal does **not** fix this; only aligning the versions does.
+
+Concretely: `Az.Accounts 5.5.0` ships MSAL 4.83.1, which matches `Microsoft.Graph` **2.40.0** exactly — while 2.39.0 ships 4.82.1 and 2.41.0 ships 4.90.0, and both of those fail against it. If you hit that error, compare the two:
+
+```powershell
+# what Az brought in
+(Get-ChildItem (Get-Module -ListAvailable Az.Accounts | Sort-Object Version -Descending | Select-Object -First 1).ModuleBase `
+    -Recurse -Filter 'Microsoft.Identity.Client.dll' | Select-Object -First 1).VersionInfo.FileVersion
+
+# what Graph wants
+(Get-ChildItem (Get-Module -ListAvailable Microsoft.Graph.Authentication | Sort-Object Version -Descending | Select-Object -First 1).ModuleBase `
+    -Recurse -Filter 'Microsoft.Identity.Client.dll' | Select-Object -First 1).VersionInfo.FileVersion
+```
+
+Then install the `Microsoft.Graph` version whose MSAL matches, for all three modules, and re-run from a new terminal. The deploy script prints this comparison for you when the import fails.
+
+Note this is entirely separate from the `maxGraphModuleVersion` ceiling below — that one governs what gets imported into the **Automation Account** in Azure, and is driven by the *runbook's* .NET runtime rather than by anything on your machine. The two are unrelated and need not match.
+
 ### 4. Decide your deployment settings
 
 Before filling in [deploy/deploy.config.psd1](deploy/deploy.config.psd1), decide:
@@ -83,6 +101,7 @@ Before filling in [deploy/deploy.config.psd1](deploy/deploy.config.psd1), decide
 | `excludeGuests` | Whether guest accounts are excluded from scope (default `$true`). |
 | `excludeDisabledAccounts` | Whether disabled accounts are excluded from scope (default `$true`). |
 | `mfaQualifyingMethodTypes` | Comma-separated list of authentication method keys that count as "MFA registered". Leave blank for the runbook's default. Written to the `QualifyingMethodTypes` Automation Variable — also editable directly in the portal afterward. See [runbooks/README.md](runbooks/README.md#configuring-settings). |
+| `maxGraphModuleVersion` | Highest `Microsoft.Graph` version imported into the Automation Account's PowerShell 7.2 Runtime Environment. Leave blank for the default (`2.25.0`). **This is a runtime compatibility ceiling, not a preference** — raising it produces a runbook that fails with no output. See [deploy/README.md](deploy/README.md#the-graph-module-version-ceiling). |
 
 **Target group**, specifically:
 - Let the deploy script create a new, dedicated security group (default, via `targetGroupDisplayName`), or

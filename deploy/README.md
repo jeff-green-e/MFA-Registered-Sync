@@ -9,7 +9,7 @@ See [../README.md](../README.md#prerequisites) before running this for the first
 0. **Preflight** (`Assert-AzAutomationCapability`) — verifies the loaded `Az.Automation` actually supports the PowerShell 7.2 Runtime Environment before anything is created, and warns on an `Az.Accounts` old enough to fail token acquisition. See [Preflight: Az version check](#preflight-az-version-check) below.
 1. **Resource group** — create if missing.
 2. **Automation Account** — create with a system-assigned managed identity if missing; if it exists without an identity, enable one. Waits for the identity's `principalId` to actually populate before continuing (this is eventually consistent — using it too early fails silently later).
-3. **Import Graph modules into the PowerShell 7.2 Runtime Environment** — `Microsoft.Graph.Authentication`, `.Identity.SignIns`, `.Users`, `.Groups`, via `New-`/`Get-AzAutomationModule -RuntimeVersion '7.2'`, pinned to the exact version currently on PowerShell Gallery (`Find-Module`).
+3. **Import Graph modules into the PowerShell 7.2 Runtime Environment** — `Microsoft.Graph.Authentication`, `.Identity.SignIns`, `.Users`, `.Groups`, via `New-`/`Get-AzAutomationModule -RuntimeVersion '7.2'`, pinned to the newest PowerShell Gallery release **at or below `maxGraphModuleVersion`** (default `2.25.0`). A module already imported at a different version is removed and replaced. See [The Graph module version ceiling](#the-graph-module-version-ceiling).
 4. **Import and publish the runbook** as `-Type PowerShell72`.
 5. **Target group** — create a new dedicated security group, or reuse the one named in config/`-TargetGroupId`.
 6. **Automation Variables** — create or update `TargetGroupId`, `ExcludeGuests`, `ExcludeDisabledAccounts`, and (if configured) `QualifyingMethodTypes` on the Automation Account. This is the runbook's actual configuration store — see [Configuration lives in Automation Variables](#configuration-lives-in-automation-variables) below.
@@ -51,6 +51,36 @@ The PowerShell 7.1/7.2 Runtime Environment cmdlets this script depends on only e
 
 It also emits a **non-fatal warning** when `Az.Accounts` is below 3.0.0. That's the same root cause wearing a different mask: `Az` 10.0.0 ships `Az.Accounts` 2.12.3 alongside `Az.Automation` 1.9.1, and that build fails token acquisition against current Entra with `A task was canceled.` for every tenant — which `Set-AzContext` reports as `Please provide a valid tenant or a valid subscription`. `Get-AzContext` succeeding immediately afterward is a red herring; it reads cached context metadata and proves nothing about token validity. Flagging it up front saves diagnosing the same stale install twice. See [../README.md](../README.md#3-local-machine-the-box-running-the-deploy-script) for the version-to-bundle mapping.
 
+## The Graph module version ceiling
+
+`maxGraphModuleVersion` (default **2.25.0**) caps which `Microsoft.Graph` release gets imported into the Automation Account's Runtime Environment. It is a hard runtime constraint, not caution.
+
+PowerShell 7.2 runbooks execute on **.NET 6**, whose `System.Text.Json` is `6.0.0.0`. Each Graph SDK release bundles the `System.Text.Json` its assemblies were compiled against:
+
+| Graph SDK | bundled `System.Text.Json` | On the 7.2 runtime (.NET 6) |
+|---|---|---|
+| ≤ **2.25.0** | **6.0** | ✅ native match |
+| 2.26.1 – 2.35.1 | 8.0 | ⚠️ relies on module-local probing |
+| ≥ 2.36.0 | **10.0** | ❌ a .NET 10 assembly — cannot load |
+
+Import 2.36.0 or newer and `Connect-MgGraph -Identity` dies inside `Azure.Identity` with:
+
+```
+Could not load file or assembly 'System.Text.Json, Version=10.0.0.0, Culture=neutral,
+PublicKeyToken=cc7b13ffcd2ddd51'. The system cannot find the file specified.
+```
+
+The job fails **with no output whatsoever**, because it dies at module load before the runbook flushes its first log line — which makes it look like a hang or a permissions problem rather than a dependency problem.
+
+This is why the script does not simply take whatever `Find-Module` reports as newest, which is what it used to do. That made the deployment a moving target: identical inputs produced a working deployment one week and a broken one the next, purely because PSGallery had shipped a release built against a newer .NET than Azure Automation can host.
+
+**Two related behaviors worth knowing:**
+
+- **Re-import on version mismatch.** `Install-AutomationGraphModule` compares the imported version against the target and removes/re-imports when they differ. It previously skipped any module already in state `Succeeded` regardless of version, which meant an account that had received an unusable version stayed broken through every subsequent deploy, and changing the ceiling was a silent no-op. Azure Automation has no in-place module update, so a version change is necessarily remove-then-import.
+- **Raise it only with a runtime change.** Moving the runbook to the **PowerShell 7.4** runtime (.NET 8) would make the 8.0 band usable, up to 2.35.1. Nothing in Azure Automation hosts .NET 10, so 2.36.0+ is not deployable at any runtime version currently offered.
+
+Unrelated to the local `Microsoft.Graph` modules on the deploying machine — those pair with your installed `Az` version instead, and are governed by [the prerequisites](../README.md#3-local-machine-the-box-running-the-deploy-script). The two version numbers have nothing to do with each other.
+
 ## Two separate "needs Graph" surfaces — don't conflate them
 
 - **Cloud-side**: the modules imported into the Automation Account's Runtime Environment (step 3) are what the *runbook* uses at runtime, in Azure.
@@ -60,6 +90,7 @@ It also emits a **non-fatal warning** when `Az.Accounts` is below 3.0.0. That's 
 
 - **PowerShell 7.1/7.2 runbooks execute against a distinct "Runtime Environment" resource, not the classic account-wide module store — the two do not sync.** A module imported via the classic REST API (`.../automationAccounts/{name}/modules/{name}`) can show `provisioningState: Succeeded` yet be completely invisible to the runbook and to the Runtime Environment's own package list in the portal. Always import via `-RuntimeVersion '7.2'` on `New-`/`Get-AzAutomationModule` (both cmdlets need it — `Get-` without it silently checks the wrong bucket and "never finds" a module that's importing normally).
 - **Local machines commonly have multiple installed versions of `Microsoft.Graph.*` modules side by side.** PowerShell's auto-loader can resolve different Graph sub-modules to different versions within the same session, and the CLR then refuses to load a second, differently-versioned copy of the shared `Microsoft.Graph.Authentication` assembly (`Assembly with same name is already loaded`). `Import-PinnedGraphModules` forces every required local module to the newest version they all have in common before `Connect-MgGraph` runs. If it throws "No single installed version is common to...", the machine has genuinely incompatible installs and needs manual cleanup (see [../README.md](../README.md#prerequisites)). **Once a conflicting assembly is already loaded in a session, no amount of `Remove-Module`/`Import-Module -Force` can fix it retroactively** — `Remove-Module` only removes the PowerShell wrapper, not the underlying .NET assembly. If this happens, close the terminal/PowerShell window entirely and re-run in a fresh one.
+- **…but a fresh terminal only helps when the conflict came from *this* session.** The same `Assembly with same name is already loaded` error is also produced by `Az` and `Microsoft.Graph` being from different eras, because each bundles private copies of `Microsoft.Identity.Client` (MSAL), `Azure.Core` and `Azure.Identity`, and this script authenticates to Azure *before* importing Graph — so Az's copies are always loaded first. There, no new terminal will ever help; the module families have to be aligned. `Import-PinnedGraphModules` now prints both MSAL versions when the import fails so the two cases can be told apart at a glance. Upgrading `Az` alone is the usual trigger — see [the prerequisites](../README.md#3-local-machine-the-box-running-the-deploy-script).
 - **`Select-MgProfile` doesn't exist in Graph SDK v2+** (v1.0 is the only profile now) — the runbook guards the call with `Get-Command ... -ErrorAction SilentlyContinue` rather than calling it directly, since an unrecognized command isn't suppressed by `-ErrorAction` and would otherwise crash the job.
 - **`Import-AzAutomationRunbook` takes `-Type PowerShell72`, not a `-RuntimeVersion` parameter** — that parameter exists on the module cmdlets, not the runbook cmdlets.
 - **A scheduled runbook's linked parameters can't be edited in place** — not via `Register-AzAutomationScheduledRunbook` (no update mode), and not via the portal (the schedule's parameters pane is read-only after creation). This is exactly why day-to-day configuration lives in Automation Variables instead of schedule parameters — see [Configuration lives in Automation Variables](#configuration-lives-in-automation-variables) above. `Set-AzAutomationVariable`/`New-AzAutomationVariable`, by contrast, update cleanly and are reflected in the portal's Variables pane as an editable value.
