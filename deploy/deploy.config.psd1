@@ -42,4 +42,19 @@
     # not support setting persistent custom environment variables for a job, so this config
     # value is the supported way to override the default when running there.
     mfaQualifyingMethodTypes  = ''
+
+    # Highest Microsoft.Graph module version the deploy script may import into the Automation
+    # Account's PowerShell 7.2 Runtime Environment. Leave blank to use the script's built-in
+    # default (2.25.0).
+    #
+    # This is a runtime compatibility ceiling, not a preference. PowerShell 7.2 runbooks run on
+    # .NET 6 (System.Text.Json 6.0.0.0), and Graph SDK 2.26.1+ bundles System.Text.Json 8.0
+    # while 2.36.0+ bundles 10.0 - a .NET 10 assembly that cannot load there. Importing 2.36.0+
+    # yields a runbook that fails instantly with "Could not load file or assembly
+    # 'System.Text.Json, Version=10.0.0.0'" and produces no output at all.
+    #
+    # Only raise this together with a runtime change: the PowerShell 7.4 runtime (.NET 8) would
+    # make the 8.0 band (up to 2.35.1) usable. No Azure Automation runtime hosts .NET 10, so
+    # 2.36.0+ is not deployable regardless.
+    maxGraphModuleVersion     = ''
 }

@@ -63,6 +63,14 @@
     Path to the runbook script. Defaults to ..\runbooks\Sync-MfaRegisteredGroup.ps1 relative
     to this script.
 
+.PARAMETER MaxGraphModuleVersion
+    Highest Microsoft.Graph module version to import into the Automation Account's PowerShell
+    7.2 Runtime Environment. Overrides the config file's maxGraphModuleVersion; defaults to
+    2.25.0. This is a hard runtime compatibility ceiling, not a preference - PowerShell 7.2
+    runbooks run on .NET 6, and Graph SDK 2.36.0+ bundles a .NET 10 System.Text.Json that
+    cannot load there, producing a runbook that fails with no output. Raise it only alongside a
+    runtime change.
+
 .PARAMETER TargetGroupId
     Object ID of an existing target group. If omitted (here and in the config file), a new
     cloud-only security group is created using -TargetGroupDisplayName.
@@ -121,6 +129,8 @@ param(
     [string]$RunbookFilePath = (Join-Path $PSScriptRoot '..\runbooks\Sync-MfaRegisteredGroup.ps1'),
     [string]$RunbookName = 'Sync-MfaRegisteredGroup',
 
+    [string]$MaxGraphModuleVersion,
+
     [string]$TargetGroupId,
     [string]$TargetGroupDisplayName,
 
@@ -150,6 +160,28 @@ $RequiredGraphAppRoles = @(
 
 $GraphResourceAppId = '00000003-0000-0000-c000-000000000000'
 
+<#
+    Ceiling for the Microsoft.Graph modules imported into the Automation Account's PowerShell
+    7.2 Runtime Environment. This is NOT conservatism for its own sake - it's a hard runtime
+    constraint. PowerShell 7.2 runbooks execute on .NET 6, whose System.Text.Json is 6.0.0.0,
+    and each Graph SDK release bundles the System.Text.Json its assemblies were built against:
+
+        <= 2.25.0        System.Text.Json 6.0    <- matches .NET 6 natively
+        2.26.1 - 2.35.1  System.Text.Json 8.0
+        >= 2.36.0        System.Text.Json 10.0   <- a .NET 10 assembly; cannot load on .NET 6
+
+    Importing 2.36.0+ produces a runbook that fails at module load with "Could not load file or
+    assembly 'System.Text.Json, Version=10.0.0.0'" and emits no output at all, because it dies
+    before the first log line is flushed. Taking whatever Find-Module returns as newest - which
+    this script used to do - means the deployment silently breaks the day PSGallery ships a
+    release built against a newer .NET than the runtime can host.
+
+    Raise this only alongside a runtime change: moving the runbook to the PowerShell 7.4
+    runtime (.NET 8) would make the 8.0 band usable. Nothing in Azure Automation hosts .NET 10
+    today, so 2.36.0+ is not deployable here at any runtime version.
+#>
+$DefaultMaxGraphModuleVersion = '2.25.0'
+
 # --- Load config file and resolve effective parameter values ------------
 
 $config = @{}
@@ -176,6 +208,7 @@ $AutomationAccountName    = Resolve-ConfigValue $AutomationAccountName $config.a
 $TargetGroupId            = Resolve-ConfigValue $TargetGroupId $config.targetGroupId
 $TargetGroupDisplayName   = Resolve-ConfigValue $TargetGroupDisplayName $config.targetGroupDisplayName 'sg-MFA-Registered-Users'
 $MfaQualifyingMethodTypes = Resolve-ConfigValue $MfaQualifyingMethodTypes $config.mfaQualifyingMethodTypes ''
+$MaxGraphModuleVersion    = Resolve-ConfigValue $MaxGraphModuleVersion $config.maxGraphModuleVersion $DefaultMaxGraphModuleVersion
 
 if (-not $PSBoundParameters.ContainsKey('CadenceDays')) {
     $CadenceDays = if ($null -ne $config.cadenceDays) { [int]$config.cadenceDays } else { 1 }
@@ -209,6 +242,7 @@ Write-Host "  ExcludeDisabledAccounts   : $ExcludeDisabledAccounts"
 Write-Host "  MfaQualifyingMethodTypes  : $(if ($MfaQualifyingMethodTypes) { $MfaQualifyingMethodTypes } else { '<not set - runbook will use its environment variable / built-in default>' })"
 Write-Host "  ScheduleName              : $ScheduleName"
 Write-Host "  RequiredGraphModules      : $($RequiredGraphModules -join ', ')"
+Write-Host "  MaxGraphModuleVersion     : $MaxGraphModuleVersion (ceiling for the PowerShell 7.2 Runtime Environment - see notes in this script)"
 Write-Host '=============================='
 
 function Assert-AzAutomationCapability {
@@ -320,13 +354,31 @@ function Wait-AutomationModuleImport {
 function Install-AutomationGraphModule {
     param([string]$ModuleName)
 
+    # Newest release at or below the ceiling, rather than newest outright - see the
+    # $DefaultMaxGraphModuleVersion notes above for why the ceiling is a hard requirement.
+    $version = (Find-Module -Name $ModuleName -MaximumVersion $MaxGraphModuleVersion `
+            -Repository PSGallery -ErrorAction Stop).Version.ToString()
+
+    <#
+        Compare versions, don't just check for presence. This check used to return early on any
+        module already in state 'Succeeded', which made the script unable to correct its own
+        earlier mistakes: an account that had been given an unusable version stayed broken
+        through every subsequent deploy, and changing the ceiling above was a silent no-op.
+        Azure Automation has no in-place module update either, so moving to a different version
+        means removing the existing package first and importing the replacement.
+    #>
     $existing = Get-AutomationModuleRecord -ModuleName $ModuleName
     if ($existing -and $existing.ProvisioningState -eq 'Succeeded') {
-        Write-Host "Module $ModuleName already imported (version $($existing.Version))."
-        return
+        if ($existing.Version -eq $version) {
+            Write-Host "Module $ModuleName already imported at the target version ($version)."
+            return
+        }
+
+        Write-Host "Module $ModuleName is imported at version $($existing.Version) but the target is $version - replacing it."
+        Remove-AzAutomationModule -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName `
+            -RuntimeVersion '7.2' -Name $ModuleName -Force -ErrorAction Stop | Out-Null
     }
 
-    $version = (Find-Module -Name $ModuleName -Repository PSGallery -ErrorAction Stop).Version.ToString()
     $contentLink = "https://www.powershellgallery.com/api/v2/package/$ModuleName/$version"
 
     Write-Host "Importing module $ModuleName version $version into the PowerShell 7.2 Runtime Environment..."
@@ -392,10 +444,60 @@ function Import-PinnedGraphModules {
             Import-Module -Name $name -RequiredVersion $pinnedVersion -Force -ErrorAction Stop
         }
         catch {
-            if ($_.Exception.Message -match 'Assembly with same name is already loaded') {
-                throw "A different version of a Microsoft.Graph assembly is already loaded in this PowerShell session (from an earlier command or a previous run of this script) and can't be swapped out at runtime - Remove-Module only removes the PowerShell wrapper, not the underlying .NET assembly. Close this terminal/PowerShell window, open a brand new one, and re-run this script there."
+            $originalError = $_
+            if ($originalError.Exception.Message -notmatch 'Assembly with same name is already loaded') { throw }
+
+            <#
+                Two genuinely different problems produce this same message, and only one of them
+                is fixed by a new terminal:
+
+                  1. A stale session - something earlier in THIS process already loaded a
+                     different version of this module. A fresh window does fix that.
+                  2. Az and Microsoft.Graph disagreeing about a shared dependency. Az.Accounts
+                     and Microsoft.Graph.Authentication each bundle their own copies of
+                     Microsoft.Identity.Client (MSAL), Azure.Core and Azure.Identity. This
+                     script authenticates to Azure first, so Az's copies are already loaded by
+                     the time Graph imports - and if the two module families are from different
+                     eras (e.g. Az.Accounts 5.5.0 shipping MSAL 4.83.1 against Graph 2.39.0
+                     shipping 4.82.1), the CLR refuses the second copy. No new terminal can ever
+                     help; the two families have to be brought into alignment.
+
+                This used to report cause 1 unconditionally, which sent people to restart a
+                terminal repeatedly while the real conflict went unnamed. The original exception
+                identifies the assembly and version actually in conflict, so surface it and
+                print the comparison that distinguishes the two cases.
+            #>
+            $loadedMsal = [System.AppDomain]::CurrentDomain.GetAssemblies() |
+                Where-Object { $_.GetName().Name -eq 'Microsoft.Identity.Client' } |
+                ForEach-Object { $_.GetName().Version.ToString() } |
+                Select-Object -First 1
+            $azAccounts = Get-Module Az.Accounts | Sort-Object Version -Descending | Select-Object -First 1
+            $graphBase = (Get-Module -ListAvailable -Name $name | Where-Object { $_.Version -eq $pinnedVersion } | Select-Object -First 1).ModuleBase
+            $graphMsal = if ($graphBase) {
+                (Get-ChildItem $graphBase -Recurse -Filter 'Microsoft.Identity.Client.dll' -ErrorAction SilentlyContinue |
+                    Select-Object -First 1).VersionInfo.FileVersion
             }
-            throw
+
+            throw @"
+Failed to load '$name' $pinnedVersion - a conflicting copy of a shared assembly is already loaded in this process.
+
+Original error:
+  $($originalError.Exception.Message)
+
+Versions in play:
+  Az.Accounts loaded                            : $(if ($azAccounts) { $azAccounts.Version } else { '(not loaded)' })
+  Microsoft.Identity.Client loaded (from Az)    : $(if ($loadedMsal) { $loadedMsal } else { '(not loaded)' })
+  Microsoft.Identity.Client in Graph $pinnedVersion : $(if ($graphMsal) { $graphMsal } else { '(not found)' })
+
+If those two Microsoft.Identity.Client versions DIFFER, this is an Az/Graph version mismatch and a new
+terminal will not help. Install a Microsoft.Graph version whose bundled MSAL matches the one Az.Accounts
+ships, then re-run from a new terminal:
+  Install-Module Microsoft.Graph.Authentication -RequiredVersion <version> -Scope CurrentUser -Force
+  (repeat for Microsoft.Graph.Groups and Microsoft.Graph.Applications)
+
+If they MATCH, this is a stale session: close this terminal/PowerShell window entirely, open a brand new
+one, and re-run there. Remove-Module only drops the PowerShell wrapper, not the loaded .NET assembly.
+"@
         }
     }
 
